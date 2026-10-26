@@ -1,0 +1,683 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+from scipy.optimize import differential_evolution
+
+# ==========================================================
+# APP CONFIG
+# ==========================================================
+
+st.set_page_config(
+    page_title="Vehicle Weibull Forecast",
+    layout="wide"
+)
+
+# ==========================================================
+# LOAD DATA
+# ==========================================================
+
+@st.cache_data
+def load_data(claim_file, park_file):
+
+    claims = pd.read_csv(claim_file)
+    park = pd.read_csv(park_file)
+
+    date_cols = [
+        "Manufacturing_Date",
+        "Delivery_Date",
+        "Claim_Date"
+    ]
+
+    for col in date_cols:
+        claims[col] = pd.to_datetime(claims[col])
+
+    claims["MIS"] = (
+        claims["Claim_Date"]
+        -
+        claims["Delivery_Date"]
+    ).dt.days / 30.4375
+
+    claims["Delivery_Month"] = (
+        claims["Delivery_Date"]
+        .dt.to_period("M")
+        .astype(str)
+    )
+
+    claims["Manufacturing_Month"] = (
+        claims["Manufacturing_Date"]
+        .dt.to_period("M")
+        .astype(str)
+    )
+
+    return claims, park
+
+
+# ==========================================================
+# DESCRIPTIVE PLOT 1
+# ==========================================================
+
+def plot_mis_histogram(claims):
+
+    fig = px.histogram(
+        claims,
+        x="MIS",
+        nbins=36,
+        title="MIS Distribution"
+    )
+
+    fig.update_layout(
+        xaxis_title="Months In Service",
+        yaxis_title="Claims"
+    )
+
+    return fig
+
+
+# ==========================================================
+# DESCRIPTIVE PLOT 2
+# ==========================================================
+
+def plot_cohort_mileage(claims):
+
+    counts = (
+        claims
+        .groupby("Manufacturing_Month")
+        .size()
+        .reset_index(name="Claims")
+    )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=counts["Manufacturing_Month"],
+            y=counts["Claims"],
+            name="Claims"
+        )
+    )
+
+    months = counts["Manufacturing_Month"].tolist()
+
+    for month in months:
+
+        mileage_data = claims.loc[
+            claims["Manufacturing_Month"] == month,
+            "Mileage"
+        ]
+
+        fig.add_trace(
+            go.Box(
+                y=mileage_data,
+                name=month,
+                yaxis="y2",
+                boxpoints=False
+            )
+        )
+
+    fig.update_layout(
+
+        title="Claims & Mileage by Manufacturing Month",
+
+        yaxis=dict(
+            title="Claim Count"
+        ),
+
+        yaxis2=dict(
+            title="Mileage",
+            overlaying="y",
+            side="right"
+        )
+    )
+
+    return fig
+
+
+# ==========================================================
+# BUILD DELIVERY COHORTS
+# ==========================================================
+
+def build_delivery_cohorts(claims, park):
+
+    analysis_date = claims["Claim_Date"].max()
+
+    cohort_claims = (
+        claims
+        .groupby("Delivery_Month")
+        .size()
+        .reset_index(name="Claims")
+    )
+
+    cohort = park.copy()
+
+    cohort.columns = [
+        "Delivery_Month",
+        "Volume"
+    ]
+
+    cohort["Delivery_Month"] = (
+        pd.to_datetime(
+            cohort["Delivery_Month"]
+        )
+        .dt.to_period("M")
+        .astype(str)
+    )
+
+    cohort = cohort.merge(
+        cohort_claims,
+        on="Delivery_Month",
+        how="left"
+    )
+
+    cohort["Claims"] = (
+        cohort["Claims"]
+        .fillna(0)
+    )
+
+    cohort["Delivery_Month_Date"] = pd.to_datetime(
+        cohort["Delivery_Month"]
+    )
+
+    cohort["AgeMonths"] = (
+
+        (
+            analysis_date
+            -
+            cohort["Delivery_Month_Date"]
+        ).dt.days
+
+        / 30.4375
+    )
+
+    cohort["ObservedRate"] = (
+        cohort["Claims"]
+        /
+        cohort["Volume"]
+    )
+
+    return cohort
+
+
+# ==========================================================
+# 2D WEIBULL MODEL
+# ==========================================================
+
+def warranty_failure_probability(
+    mis,
+    mileage,
+    beta_mis,
+    eta_mis,
+    beta_km,
+    eta_km
+):
+
+    term1 = (mis / eta_mis) ** beta_mis
+
+    term2 = (
+        mileage / eta_km
+    ) ** beta_km
+
+    p = 1 - np.exp(
+        -(term1 + term2)
+    )
+
+    return p
+
+
+# ==========================================================
+# OBJECTIVE FUNCTION
+# ==========================================================
+
+def objective_function(
+        params,
+        claims,
+        cohort):
+
+    beta_mis, eta_mis, beta_km, eta_km = params
+
+    if (
+        beta_mis <= 0
+        or eta_mis <= 0
+        or beta_km <= 0
+        or eta_km <= 0
+    ):
+        return 1e20
+
+    # -----------------------------
+    # CLAIM LIKELIHOOD
+    # -----------------------------
+
+    probabilities = warranty_failure_probability(
+
+        claims["MIS"].values,
+
+        claims["Mileage"].values,
+
+        beta_mis,
+        eta_mis,
+
+        beta_km,
+        eta_km
+
+    )
+
+    probabilities = np.clip(
+        probabilities,
+        1e-12,
+        1-1e-12
+    )
+
+    nll = -np.sum(
+        np.log(
+            probabilities
+        )
+    )
+
+    # -----------------------------
+    # COHORT RATE FIT
+    # -----------------------------
+
+    expected_rates = []
+
+    reference_km = claims[
+        "Mileage"
+    ].median()
+
+    for age in cohort["AgeMonths"]:
+
+        rate = warranty_failure_probability(
+            age,
+            reference_km,
+            beta_mis,
+            eta_mis,
+            beta_km,
+            eta_km
+        )
+
+        expected_rates.append(rate)
+
+    expected_rates = np.array(
+        expected_rates
+    )
+
+    mse = np.mean(
+        (
+            cohort["ObservedRate"]
+            -
+            expected_rates
+        ) ** 2
+    )
+
+    return nll + mse * 100000
+
+
+# ==========================================================
+# OPTIMIZATION
+# ==========================================================
+
+def optimize_model(
+        claims,
+        cohort):
+
+    bounds = [
+
+        (0.5,10),      # beta MIS
+
+        (1,120),       # eta MIS
+
+        (0.5,10),      # beta Mileage
+
+        (5000,300000)  # eta Mileage
+    ]
+
+    result = differential_evolution(
+
+        objective_function,
+
+        bounds=bounds,
+
+        args=(
+            claims,
+            cohort
+        ),
+
+        seed=42,
+
+        maxiter=300,
+
+        popsize=25
+    )
+
+    return result.x
+
+
+# ==========================================================
+# FORECAST COHORTS
+# ==========================================================
+
+def forecast_cohorts(
+        cohort,
+        claims,
+        parameters):
+
+    beta_mis, eta_mis, beta_km, eta_km = parameters
+
+    representative_mileage = (
+        claims["Mileage"]
+        .median()
+    )
+
+    cohort = cohort.copy()
+
+    cohort["ExpectedRate"] = (
+        warranty_failure_probability(
+            cohort["AgeMonths"],
+            representative_mileage,
+
+            beta_mis,
+            eta_mis,
+
+            beta_km,
+            eta_km
+        )
+    )
+
+    cohort["ExpectedClaims"] = (
+
+        cohort["ExpectedRate"]
+
+        *
+
+        cohort["Volume"]
+
+    )
+
+    return cohort
+
+
+# ==========================================================
+# RATE PLOT
+# ==========================================================
+
+def forecast_plot(cohort):
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+
+            x=cohort["Delivery_Month"],
+
+            y=cohort["ObservedRate"],
+
+            name="Observed Rate"
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+
+            x=cohort["Delivery_Month"],
+
+            y=cohort["ExpectedRate"],
+
+            mode="lines+markers",
+
+            name="Expected Weibull Rate"
+        )
+    )
+
+    fig.update_layout(
+
+        title="Observed vs Expected Cohort Rate",
+
+        yaxis_title="Claim Rate"
+    )
+
+    return fig
+
+
+# ==========================================================
+# SEMILOG PLOT
+# ==========================================================
+
+def semilog_plot(
+        claims,
+        params):
+
+    beta_mis, eta_mis, beta_km, eta_km = params
+
+    bins = np.arange(
+        0,
+        37,
+        1
+    )
+
+    observed, edges = np.histogram(
+        claims["MIS"],
+        bins=bins
+    )
+
+    centers = edges[:-1]
+
+    expected = []
+
+    reference_km = (
+        claims["Mileage"]
+        .median()
+    )
+
+    total_claims = len(claims)
+
+    for t in centers:
+
+        p1 = warranty_failure_probability(
+            t,
+            reference_km,
+
+            beta_mis,
+            eta_mis,
+
+            beta_km,
+            eta_km
+        )
+
+        p2 = warranty_failure_probability(
+            t + 1,
+            reference_km,
+
+            beta_mis,
+            eta_mis,
+
+            beta_km,
+            eta_km
+        )
+
+        expected.append(
+            total_claims * (p2 - p1)
+        )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=centers,
+            y=observed,
+            mode="markers",
+            name="Observed"
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=centers,
+            y=expected,
+            mode="lines",
+            name="Weibull"
+        )
+    )
+
+    fig.update_layout(
+
+        title="Semi-Log Weibull Distribution",
+
+        xaxis_title="MIS",
+
+        yaxis_title="Claims",
+
+        yaxis_type="log"
+    )
+
+    return fig
+
+
+# ==========================================================
+# R²
+# ==========================================================
+
+def cohort_r2(df):
+
+    ss_res = np.sum(
+        (
+            df["ObservedRate"]
+            -
+            df["ExpectedRate"]
+        ) ** 2
+    )
+
+    ss_tot = np.sum(
+        (
+            df["ObservedRate"]
+            -
+            df["ObservedRate"].mean()
+        ) ** 2
+    )
+
+    return 1 - ss_res / ss_tot
+
+
+# ==========================================================
+# STREAMLIT
+# ==========================================================
+
+st.title(
+    "Vehicle Warranty Weibull Forecast"
+)
+
+claim_file = st.file_uploader(
+    "Upload Claims File",
+    type="csv"
+)
+
+park_file = st.file_uploader(
+    "Upload Vehicle Park File",
+    type="csv"
+)
+
+if claim_file and park_file:
+
+    claims, park = load_data(
+        claim_file,
+        park_file
+    )
+
+    st.header("Descriptive Analysis")
+
+    st.plotly_chart(
+        plot_mis_histogram(claims),
+        use_container_width=True
+    )
+
+    st.plotly_chart(
+        plot_cohort_mileage(claims),
+        use_container_width=True
+    )
+
+    cohort = build_delivery_cohorts(
+        claims,
+        park
+    )
+
+    params = optimize_model(
+        claims,
+        cohort
+    )
+
+    (
+        beta_mis,
+        eta_mis,
+        beta_km,
+        eta_km
+    ) = params
+
+    forecast = forecast_cohorts(
+        cohort,
+        claims,
+        params
+    )
+
+    r2 = cohort_r2(
+        forecast
+    )
+
+    st.header("Optimized Parameters")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "β MIS",
+        round(beta_mis,3)
+    )
+
+    c2.metric(
+        "η MIS",
+        round(eta_mis,1)
+    )
+
+    c3.metric(
+        "β Mileage",
+        round(beta_km,3)
+    )
+
+    c4.metric(
+        "η Mileage",
+        round(eta_km,0)
+    )
+
+    c5.metric(
+        "R²",
+        round(r2,3)
+    )
+
+    st.header(
+        "Warranty Forecast"
+    )
+
+    st.plotly_chart(
+        forecast_plot(forecast),
+        use_container_width=True
+    )
+
+    st.plotly_chart(
+        semilog_plot(
+            claims,
+            params
+        ),
+        use_container_width=True
+    )
+
+    st.dataframe(
+        forecast[
+            [
+                "Delivery_Month",
+                "Volume",
+                "Claims",
+                "ObservedRate",
+                "ExpectedRate",
+                "ExpectedClaims"
+            ]
+        ]
+    )
